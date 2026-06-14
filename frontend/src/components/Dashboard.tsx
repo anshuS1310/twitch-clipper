@@ -472,6 +472,7 @@ const Dashboard: React.FC = () => {
           -webkit-appearance: none; width: 18px; height: 18px;
           border-radius: 50%; background: ${accentColor};
           box-shadow: 0 0 6px ${accentColor}80; cursor: pointer;
+          margin-top: -6.5px;
           transition: transform 0.1s ease;
         }
         input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.15); }

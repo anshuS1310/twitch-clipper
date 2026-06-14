@@ -44,10 +44,11 @@ def run_api_server():
     logger.info("🚀 Starting API server...")
     from api.main import app
     
+    port = int(os.getenv("PORT", "8000"))
     config = uvicorn.Config(
         app=app,
         host="0.0.0.0",
-        port=8000,
+        port=port,
         log_level="info"
     )
     server = uvicorn.Server(config)

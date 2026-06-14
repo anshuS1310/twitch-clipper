@@ -81,7 +81,13 @@ interface Clip {
   download_url?: string;
 }
 
-const API_BASE_URL = 'http://localhost:8000';
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
+const getWebSocketUrl = (channel: string) => {
+  const proto = API_BASE_URL.startsWith('https') ? 'wss' : 'ws';
+  const host = API_BASE_URL.replace(/^https?:\/\//, '');
+  return `${proto}://${host}/ws/${channel}`;
+};
 
 // 5 game wallpapers as requested by user
 const WALLPAPERS = [
@@ -274,7 +280,7 @@ const Dashboard: React.FC = () => {
     if (websocketRef.current) {
       websocketRef.current.close();
     }
-    const ws = new WebSocket(`ws://localhost:8000/ws/${channel}`);
+    const ws = new WebSocket(getWebSocketUrl(channel));
     websocketRef.current = ws;
     ws.onopen = () => { setIsConnected(true); setError(''); };
     ws.onmessage = (event) => {
@@ -645,7 +651,7 @@ const Dashboard: React.FC = () => {
                 <div className="pt-2 border-t border-white/10">
                   <div className="flex items-center space-x-2">
                     <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping" />
-                    <span className="text-emerald-300 text-[13px] font-bold">🟢 API Online — port 8000</span>
+                    <span className="text-emerald-300 text-[13px] font-bold">🟢 API Connected</span>
                   </div>
                 </div>
               </div>

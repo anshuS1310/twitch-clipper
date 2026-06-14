@@ -5,7 +5,6 @@ import asyncio
 from twitchio.ext import commands
 from dotenv import load_dotenv
 import threading
-import tkinter as tk
 import time
 import signal
 import sys

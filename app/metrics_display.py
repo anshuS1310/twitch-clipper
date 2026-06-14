@@ -1,5 +1,3 @@
-import tkinter as tk
-from tkinter import ttk
 import queue
 from datetime import datetime
 import threading
@@ -8,6 +6,14 @@ import time
 import asyncio
 
 logger = logging.getLogger(__name__)
+
+try:
+    import tkinter as tk
+    from tkinter import ttk
+    TKINTER_AVAILABLE = True
+except ImportError:
+    TKINTER_AVAILABLE = False
+    logger.warning("⚠️ Tkinter not available. Metrics GUI display will be disabled (headless mode).")
 
 class MetricsDisplay:
     def __init__(self, channel="Unknown"):
@@ -47,6 +53,8 @@ class MetricsDisplay:
         
     def initialize(self):
         """Initialize the GUI (must be called from the main thread)"""
+        if not TKINTER_AVAILABLE:
+            return
         if self.root is not None:
             return  # Already initialized
             
@@ -382,6 +390,9 @@ class MultiChannelMetricsDisplay:
         
     def run(self):
         """Run all the metric displays."""
+        if not TKINTER_AVAILABLE:
+            self.logger.warning("Cannot run metrics display: Tkinter is not available.")
+            return
         if not self.displays:
             self.logger.warning("No channel displays to run! Make sure to call initialize_displays() first.")
             return

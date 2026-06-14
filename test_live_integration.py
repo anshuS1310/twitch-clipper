@@ -51,8 +51,8 @@ def test_live_data(channel="xqc"):
             print(f"✅ Live data for {channel}:")
             print(f"   👥 Viewers: {stats.get('viewer_count', 0):,}")
             print(f"   💬 Total Messages: {data_status.get('total_messages', 0)}")
-            print(f"   ⚡ Velocity: {stats.get('raw_velocity', 0):.2f} msg/sec")
-            print(f"   📈 Burst Score: {stats.get('burst_score', 0):.1f}")
+            print(f"   ⚡ Velocity: {stats.get('raw_velocity', 0):.3f} msg/sec")
+            print(f"   📈 Burst Score: {stats.get('burst_score', 0):.3f}")
             print(f"   🎯 Clip Score: {stats.get('clip_worthy_score', 0):.3f}")
             print(f"   🤖 ML Status: {ml_status.get('model_status', 'unknown')}")
             print(f"   📊 Training Samples: {ml_status.get('training_samples', 0)}")
@@ -95,9 +95,9 @@ def monitor_live_updates(channel="xqc", duration=30):
                 if previous_message_count is not None:
                     if message_count > previous_message_count:
                         diff = message_count - previous_message_count
-                        print(f"📈 Messages increased by {diff} (total: {message_count}, velocity: {velocity:.1f})")
+                        print(f"📈 Messages increased by {diff} (total: {message_count}, velocity: {velocity:.3f})")
                     elif message_count == previous_message_count:
-                        print(f"📊 Messages stable at {message_count} (velocity: {velocity:.1f})")
+                        print(f"📊 Messages stable at {message_count} (velocity: {velocity:.3f})")
                 
                 previous_message_count = message_count
             

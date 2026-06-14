@@ -34,6 +34,16 @@ class MetricsDisplay:
         self.burst_var = None
         self.ml_score_var = None
         self.rule_score_var = None
+        self.hybrid_score_var = None
+        
+        # Peak tracking values
+        self.peaks = {
+            "msg_sec": 0.0,
+            "burst": 0.0,
+            "ml_score": 0.0,
+            "rule_score": 0.0,
+            "hybrid_score": 0.0
+        }
         
     def initialize(self):
         """Initialize the GUI (must be called from the main thread)"""
@@ -44,7 +54,7 @@ class MetricsDisplay:
             # Create the root window
             self.root = tk.Tk() if not tk._default_root else tk.Toplevel()
             self.root.title(f"Twitch Chat Metrics - {self.last_channel}")
-            self.root.geometry("350x250")
+            self.root.geometry("380x280")
             
             # Calculate position based on channel name hash to distribute windows
             channel_hash = hash(self.last_channel) % 10000
@@ -54,9 +64,9 @@ class MetricsDisplay:
             # Center the window on screen with offset
             screen_width = self.root.winfo_screenwidth()
             screen_height = self.root.winfo_screenheight()
-            x = (screen_width - 350) // 2 + offset_x
-            y = (screen_height - 250) // 2 + offset_y
-            self.root.geometry(f"350x250+{x}+{y}")
+            x = (screen_width - 380) // 2 + offset_x
+            y = (screen_height - 280) // 2 + offset_y
+            self.root.geometry(f"380x280+{x}+{y}")
             
             # Set up window close handler
             self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -71,7 +81,7 @@ class MetricsDisplay:
                 text=f"Channel: {self.last_channel}",
                 font=('Arial', 16, 'bold')
             )
-            self.channel_label.grid(row=0, column=0, pady=10)
+            self.channel_label.grid(row=0, column=0, pady=5)
             
             # Metrics frame
             self.metrics_frame = ttk.LabelFrame(
@@ -81,13 +91,14 @@ class MetricsDisplay:
             )
             self.metrics_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
             
-            # Create metric labels
+            # Create metric labels (with Peak indicators)
             self.metrics = {
                 "viewers": ("👥 Viewers", "0"),
-                "msg_sec": ("⚡ Msg/sec", "0.0"),
-                "burst": ("🎭 Emote Burst", "0.00"),
-                "ml_score": ("🤖 ML Score", "0.000"),
-                "rule_score": ("🤖 Rule Score", "0.000")
+                "msg_sec": ("⚡ Msg/sec", "0.0 (Peak: 0.0)"),
+                "burst": ("🎭 Emote Burst", "0.0 (Peak: 0.0)"),
+                "ml_score": ("🤖 ML Score", "0.000 (Peak: 0.000)"),
+                "rule_score": ("🤖 Rule Score", "0.000 (Peak: 0.000)"),
+                "hybrid_score": ("🔥 Hybrid Score", "0.000 (Peak: 0.000)")
             }
             
             # Create and place metric labels
@@ -95,15 +106,15 @@ class MetricsDisplay:
                 ttk.Label(
                     self.metrics_frame,
                     text=label_text + ":",
-                    font=('Arial', 12)
-                ).grid(row=i, column=0, sticky=tk.W, pady=2)
+                    font=('Arial', 11)
+                ).grid(row=i, column=0, sticky=tk.W, pady=1)
                 
                 setattr(self, f"{key}_var", tk.StringVar(value=value))
                 ttk.Label(
                     self.metrics_frame,
                     textvariable=getattr(self, f"{key}_var"),
-                    font=('Arial', 12, 'bold')
-                ).grid(row=i, column=1, sticky=tk.W, padx=10, pady=2)
+                    font=('Arial', 11, 'bold')
+                ).grid(row=i, column=1, sticky=tk.W, padx=10, pady=1)
             
             # Status bar
             self.status_var = tk.StringVar(value="Initializing...")
@@ -168,21 +179,32 @@ class MetricsDisplay:
             # Update metrics
             self.viewers_var.set(f"{stats.get('viewer_count', 0):,}")
             
-            # Format velocity
+            # Get values
             raw_velocity = stats.get('raw_velocity', 0.0)
             if isinstance(raw_velocity, str):
-                self.msg_sec_var.set(raw_velocity)
-            else:
-                if raw_velocity > 100:
-                    self.msg_sec_var.set(f"{raw_velocity:.0f}")
-                elif raw_velocity > 10:
-                    self.msg_sec_var.set(f"{raw_velocity:.1f}")
-                else:
-                    self.msg_sec_var.set(f"{raw_velocity:.1f}")
+                try:
+                    raw_velocity = float(raw_velocity)
+                except ValueError:
+                    raw_velocity = 0.0
             
-            self.burst_var.set(f"{stats.get('burst_score', 0.0):.1f}")
-            self.ml_score_var.set(f"{stats.get('clip_worthy_score', 0.0):.3f}")
-            self.rule_score_var.set(f"{stats.get('rule_score', 0.0):.3f}")
+            burst_score = stats.get('burst_score', 0.0)
+            ml_score = stats.get('ml_score', 0.0)
+            rule_score = stats.get('rule_score', 0.0)
+            hybrid_score = stats.get('clip_worthy_score', 0.0)
+            
+            # Update peak values
+            self.peaks['msg_sec'] = max(self.peaks['msg_sec'], raw_velocity)
+            self.peaks['burst'] = max(self.peaks['burst'], burst_score)
+            self.peaks['ml_score'] = max(self.peaks['ml_score'], ml_score)
+            self.peaks['rule_score'] = max(self.peaks['rule_score'], rule_score)
+            self.peaks['hybrid_score'] = max(self.peaks['hybrid_score'], hybrid_score)
+            
+            # Set strings with current and peak values
+            self.msg_sec_var.set(f"{raw_velocity:.3f} (Peak: {self.peaks['msg_sec']:.3f})")
+            self.burst_var.set(f"{burst_score:.3f} (Peak: {self.peaks['burst']:.3f})")
+            self.ml_score_var.set(f"{ml_score:.3f} (Peak: {self.peaks['ml_score']:.3f})")
+            self.rule_score_var.set(f"{rule_score:.3f} (Peak: {self.peaks['rule_score']:.3f})")
+            self.hybrid_score_var.set(f"{hybrid_score:.3f} (Peak: {self.peaks['hybrid_score']:.3f})")
             
             # Update status
             status = []
@@ -267,12 +289,7 @@ class MetricsDisplay:
                 
             # Format velocity with more precision for high numbers
             raw_velocity = stats.get('raw_velocity', 0.0)
-            if raw_velocity > 100:
-                stats['raw_velocity'] = f"{raw_velocity:.0f}"
-            elif raw_velocity > 10:
-                stats['raw_velocity'] = f"{raw_velocity:.1f}"
-            else:
-                stats['raw_velocity'] = f"{raw_velocity:.2f}"
+            stats['raw_velocity'] = f"{raw_velocity:.3f}"
                 
             self.update_queue.put((channel, stats, recent_messages))
         except Exception as e:

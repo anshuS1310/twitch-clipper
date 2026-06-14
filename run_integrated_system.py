@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 # Load environment variables from .env file
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
-load_dotenv(dotenv_path)
+load_dotenv(dotenv_path, override=True)
 
 # Configure logging
 logging.basicConfig(
@@ -68,6 +68,17 @@ async def main():
     """Run both API and bot integrated"""
     logger.info("🌟 Starting integrated live Twitch analytics system...")
     
+    # Validate and refresh Twitch token before starting the services
+    try:
+        from app.token_helper import validate_and_refresh_token
+        logger.info("🔑 Running startup token check...")
+        if not validate_and_refresh_token():
+            logger.error("❌ Token validation/refresh failed. Bot connection may fail.")
+        else:
+            logger.info("✅ Startup token check passed.")
+    except Exception as e:
+        logger.error(f"❌ Error during token verification on startup: {e}")
+        
     # Check if API is already running
     if check_api_running():
         logger.info("📡 API server already running - using existing instance")

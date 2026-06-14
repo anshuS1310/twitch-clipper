@@ -26,14 +26,34 @@ logger = logging.getLogger(__name__)
 # Set debug logging for chat analyzer
 logging.getLogger('app.chat_analyzer_ml').setLevel(logging.DEBUG)
 
+# Global active bot reference
+active_bot = None
+
 class ClipperBot(commands.Bot):
     def __init__(self):
         # Load environment variables
         dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
-        load_dotenv(dotenv_path)
+        load_dotenv(dotenv_path, override=True)
+        
+        # Register global active bot reference
+        global active_bot
+        active_bot = self
         
         # Initialize logger first
         self.logger = logging.getLogger(__name__)
+        
+        # Validate and refresh Twitch OAuth token before starting
+        try:
+            from .token_helper import validate_and_refresh_token
+            self.logger.info("🔑 Checking token validity for bot initialization...")
+            if validate_and_refresh_token():
+                self.logger.info("✅ Token verification passed.")
+                # Reload env to fetch updated access token
+                load_dotenv(dotenv_path, override=True)
+            else:
+                self.logger.error("❌ Token verification/refresh failed. Connection errors may occur.")
+        except Exception as e:
+            self.logger.error(f"❌ Error during token validation/refresh: {e}")
         
         # Get channels from environment or default to test channel
         channels_str = os.getenv('TWITCH_CHANNELS', 'your_channel_name')
@@ -72,9 +92,13 @@ class ClipperBot(commands.Bot):
             initial_channels=channels
         )
         
-        # Clip cooldown mechanism - fixed value
-        self.cooldown_period = 10  # Cooldown of 10 seconds between clips
+        # Clip cooldown mechanism
+        self.cooldown_period = int(os.getenv('CLIP_COOLDOWN', '60'))  # Default to 60s cooldown between clips
         self.clip_cooldowns = {}  # Store last clip time per channel
+        self.clip_threshold = float(os.getenv('CLIP_THRESHOLD', '0.75'))  # Configurable threshold
+        
+        # Logging deduplication
+        self._last_viewer_counts = {}
         
         # Connection monitoring
         self.last_message_time = time.time()
@@ -91,7 +115,7 @@ class ClipperBot(commands.Bot):
         
         # Pending clips queue for delayed clip creation
         self.pending_clips = []
-        self.clip_delay = 7.0  # Delay clips by 7 seconds
+        self.clip_delay = float(os.getenv('CLIP_DELAY', '15.0'))  # Delay clips by 15 seconds to capture peak + reaction
         self.clip_scheduler_task = None
         
         # Start metrics display thread
@@ -213,7 +237,9 @@ class ClipperBot(commands.Bot):
                         if stream:
                             viewer_count = stream.viewer_count
                             self.analyzers[channel].update_viewer_count(viewer_count)
-                            logger.info(f"Updated viewer count for {channel}: {viewer_count}")
+                            if self._last_viewer_counts.get(channel) != viewer_count:
+                                logger.info(f"Updated viewer count for {channel}: {viewer_count}")
+                                self._last_viewer_counts[channel] = viewer_count
                         else:
                             # If channel not found, set to 0 but don't log error
                             self.analyzers[channel].update_viewer_count(0)
@@ -338,14 +364,14 @@ class ClipperBot(commands.Bot):
         clip_worthy_score = stats.get('clip_worthy_score', 0)
         
         # Clip is worthy if hybrid score is high enough
-        if clip_worthy_score >= 0.85:  # Higher threshold for better quality clips
+        if clip_worthy_score >= self.clip_threshold:  # Configurable threshold
             burst_score = stats.get('burst_score', 0)
             velocity_relative = stats.get('velocity_relative', 0)
             burst_relative = stats.get('burst_relative', 0)
             ml_score = stats.get('ml_score', 0)
             
             # Log the clip reason with scores
-            trigger_reason = f"velocity_rel={velocity_relative:.2f}" if velocity_relative > burst_relative else f"burst={burst_score:.1f}"
+            trigger_reason = f"velocity_rel={velocity_relative:.3f}" if velocity_relative > burst_relative else f"burst={burst_score:.3f}"
             self.logger.info(
                 f"Clip triggered: {trigger_reason} | "
                 f"Hybrid: {clip_worthy_score:.3f} | ML: {ml_score:.3f} | "
@@ -369,8 +395,8 @@ class ClipperBot(commands.Bot):
         try:
             now = time.time()
             
-            # Use fixed cooldown of 10 seconds for all channels
-            cooldown_period = 10  # Fixed cooldown of 10 seconds
+            # Use configured cooldown period
+            cooldown_period = self.cooldown_period
             
             # Check if we're still on cooldown for this channel
             if channel in self.clip_cooldowns:
@@ -396,7 +422,7 @@ class ClipperBot(commands.Bot):
             viewer_count = metrics.get('viewer_count', 0)
             
             self.logger.info(
-                f"Creating clip for {channel}: velocity={velocity:.2f}, burst={burst_score:.1f}, "
+                f"Creating clip for {channel}: velocity={velocity:.3f}, burst={burst_score:.3f}, "
                 f"viewers={viewer_count:,}"
             )
             
@@ -420,10 +446,36 @@ class ClipperBot(commands.Bot):
         """Called when the bot encounters an error."""
         logger.error(f"Bot error: {error}", exc_info=True)
         
+    async def event_command_error(self, ctx, error):
+        """Called when a command encounters an error."""
+        if isinstance(error, commands.CommandNotFound):
+            return  # Silently ignore commands meant for other bots
+        self.logger.error(f"Error executing command: {error}", exc_info=True)
+        
     def reconnect(self):
         """Attempt to reconnect the bot."""
         try:
             logger.info("Attempting to reconnect...")
+            
+            # Validate and refresh token on reconnection
+            try:
+                from .token_helper import validate_and_refresh_token
+                logger.info("🔑 Checking token validity before reconnection...")
+                if validate_and_refresh_token():
+                    # Reload env
+                    dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+                    load_dotenv(dotenv_path, override=True)
+                    new_token = os.getenv('TWITCH_ACCESS_TOKEN')
+                    if new_token:
+                        self._token = new_token
+                        if hasattr(self, '_http') and self._http:
+                            self._http.token = new_token
+                        if hasattr(self, '_connection') and self._connection:
+                            self._connection._token = new_token
+                        logger.info("🔄 Updated Bot internal token references for reconnection.")
+            except Exception as e:
+                logger.error(f"Failed to validate/refresh token during reconnect: {e}")
+
             # Create a new event loop for reconnection
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -467,8 +519,8 @@ class ClipperBot(commands.Bot):
         # Send basic stats to chat
         await ctx.send(
             f"Chat Stats | "
-            f"Velocity: {velocity:.2f}/{velocity_threshold:.1f} | "
-            f"Burst: {burst:.1f}/{burst_threshold:.1f} | "
+            f"Velocity: {velocity:.3f}/{velocity_threshold:.3f} | "
+            f"Burst: {burst:.3f}/{burst_threshold:.3f} | "
             f"ML: {ml_score:.3f} | "
             f"Hybrid: {clip_score:.3f} | "
             f"Viewers: {viewers:,}"
@@ -821,7 +873,7 @@ def main():
         else:
             # Load environment variables
             dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
-            load_dotenv(dotenv_path)
+            load_dotenv(dotenv_path, override=True)
             channels_str = os.getenv('TWITCH_CHANNELS', '')
             channels = [channel.strip() for channel in channels_str.split(',') if channel.strip()]
             logger.info(f"Using channels from environment: {channels}")

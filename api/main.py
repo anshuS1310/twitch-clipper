@@ -1,6 +1,9 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from pydantic import BaseModel
+import os
+import requests
 import asyncio
 import json
 import time
@@ -284,34 +287,69 @@ async def test_endpoint():
     }
 
 @app.post("/api/register")
-async def register_external_analyzer(channel: str):
-    """Register an external analyzer (for testing)"""
-    # This is primarily for testing - in production the bot registers directly
+async def register_channel(channel: str):
+    """Register a new channel for monitoring (lowercase conversion and dynamic joining)"""
+    channel = channel.lower().strip()
+    if not channel:
+        raise HTTPException(status_code=400, detail="Channel name cannot be empty")
+        
     from app.chat_analyzer_ml import ChatAnalyzerML
+    from app.twitch_bot import active_bot
     
     if channel not in bot_analyzers:
-        # Create a test analyzer for demonstration
-        test_analyzer = ChatAnalyzerML(window_size=30, channel=channel)
+        # Create a new analyzer
+        new_analyzer = ChatAnalyzerML(window_size=30, channel=channel)
+        bot_analyzers[channel] = new_analyzer
         
-        # Add some sample data to make it realistic
-        for i in range(15):
-            test_analyzer.add_message(
-                message=f"Test message {i} PogChamp Kappa EZ Clap",
-                user_id=f"test_user_{i}",
-                timestamp=datetime.now()
-            )
-        
-        # Set a viewer count for testing
-        test_analyzer.viewer_count = 250
-        
-        bot_analyzers[channel] = test_analyzer
-        
-        logger.info(f"Registered external analyzer for channel: {channel}")
+        # If bot is running, dynamically update its state and join
+        if active_bot:
+            active_bot.analyzers[channel] = new_analyzer
+            try:
+                await active_bot.join_channels([channel])
+                logger.info(f"Twitch bot joined channel: {channel}")
+            except Exception as e:
+                logger.error(f"Error joining channel in bot: {e}")
+                
+        # Persist the channel list to .env
+        try:
+            dotenv_path = ".env"
+            lines = []
+            if os.path.exists(dotenv_path):
+                with open(dotenv_path, "r") as f:
+                    lines = f.readlines()
+                    
+            env_dict = {}
+            for line in lines:
+                if "=" in line and not line.strip().startswith("#"):
+                    key, val = line.strip().split("=", 1)
+                    env_dict[key.strip()] = val.strip()
+            
+            current_channels = [c.strip() for c in env_dict.get("TWITCH_CHANNELS", "").split(",") if c.strip()]
+            if channel not in current_channels:
+                current_channels.append(channel)
+                channels_str = ",".join(current_channels)
+                env_dict["TWITCH_CHANNELS"] = channels_str
+                os.environ["TWITCH_CHANNELS"] = channels_str
+                
+                # Write back to .env
+                with open(dotenv_path, "w") as f:
+                    for k, v in env_dict.items():
+                        if k == "CLIP_COOLDOWN" or k == "CLIP_DELAY" or k == "CLIP_THRESHOLD":
+                            continue
+                        f.write(f"{k}={v}\n")
+                    # Append settings section
+                    f.write("\n# Clip Capture Settings\n")
+                    f.write(f"CLIP_COOLDOWN={os.getenv('CLIP_COOLDOWN', '60')}\n")
+                    f.write(f"CLIP_DELAY={os.getenv('CLIP_DELAY', '15.0')}\n")
+                    f.write(f"CLIP_THRESHOLD={os.getenv('CLIP_THRESHOLD', '0.75')}\n")
+        except Exception as e:
+            logger.error(f"Failed to persist registered channel to .env: {e}")
+            
+        logger.info(f"Registered analyzer for channel: {channel}")
         return {
             "success": True,
-            "message": f"Registered analyzer for channel '{channel}' with sample data",
-            "total_channels": len(bot_analyzers),
-            "sample_stats": test_analyzer.get_window_stats()
+            "message": f"Successfully registered and joined channel '{channel}'",
+            "total_channels": len(bot_analyzers)
         }
     else:
         return {
@@ -319,6 +357,241 @@ async def register_external_analyzer(channel: str):
             "message": f"Channel '{channel}' already registered",
             "total_channels": len(bot_analyzers)
         }
+
+@app.get("/api/clips")
+async def get_clips():
+    """Get list of generated clips from the local database file"""
+    clips_file = "recordings/clip_urls.txt"
+    clips = []
+    if os.path.exists(clips_file):
+        try:
+            with open(clips_file, "r") as f:
+                for line in f:
+                    parts = line.strip().split("\t")
+                    if len(parts) >= 3:
+                        clips.append({
+                            "url": parts[0],
+                            "edit_url": parts[1],
+                            "id": parts[2],
+                            "embed_url": f"https://clips.twitch.tv/embed?clip={parts[2]}&parent=localhost",
+                            "created_at": time.time()
+                        })
+                    elif len(parts) >= 1 and parts[0]:
+                        url = parts[0]
+                        clip_id = url.split("/")[-1] if "/" in url else url
+                        clips.append({
+                            "url": url,
+                            "edit_url": "",
+                            "id": clip_id,
+                            "embed_url": f"https://clips.twitch.tv/embed?clip={clip_id}&parent=localhost",
+                            "created_at": time.time()
+                        })
+        except Exception as e:
+            logger.error(f"Error reading clips file: {e}")
+            
+    clips.reverse()  # Newest clips first
+    return {"clips": clips, "count": len(clips)}
+
+@app.get("/api/clips/{clip_id}/download")
+async def get_clip_download_url(clip_id: str):
+    """Retrieve the direct MP4 download URL and metadata for a specific Twitch clip"""
+    try:
+        client_id = os.getenv("TWITCH_CLIENT_ID", "")
+        access_token = os.getenv("TWITCH_ACCESS_TOKEN", "")
+        
+        # Try to read credentials from running bot if environment variables are missing
+        from app.twitch_bot import active_bot
+        if active_bot:
+            if not client_id:
+                client_id = active_bot.clip_manager.client_id
+            if not access_token:
+                access_token = active_bot.clip_manager.access_token
+                
+        if not client_id or not access_token:
+            raise HTTPException(status_code=400, detail="Missing Twitch credentials to call API")
+            
+        headers = {
+            'Client-ID': client_id,
+            'Authorization': f'Bearer {access_token}'
+        }
+        
+        response = requests.get(f"https://api.twitch.tv/helix/clips?id={clip_id}", headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('data') and len(data['data']) > 0:
+                clip_data = data['data'][0]
+                thumbnail_url = clip_data.get('thumbnail_url', '')
+                
+                # Retrieve direct mp4 URL from thumbnail
+                mp4_url = ""
+                if thumbnail_url:
+                    if "-preview-" in thumbnail_url:
+                        mp4_url = thumbnail_url.split("-preview-")[0] + ".mp4"
+                    else:
+                        mp4_url = thumbnail_url.replace("-preview-480x272.jpg", ".mp4")
+                        
+                return {
+                    "clip_id": clip_id,
+                    "download_url": mp4_url,
+                    "title": clip_data.get("title", "Twitch Highlight"),
+                    "broadcaster_name": clip_data.get("broadcaster_name", ""),
+                    "view_count": clip_data.get("view_count", 0),
+                    "duration": clip_data.get("duration", 0.0)
+                }
+        raise HTTPException(status_code=404, detail="Clip not found on Twitch")
+    except Exception as e:
+        logger.error(f"Error fetching download link for clip {clip_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/clips/{clip_id}")
+async def delete_clip(clip_id: str):
+    """Delete a clip from the local catalog file and synchronise bot memory"""
+    clips_file = "recordings/clip_urls.txt"
+    if not os.path.exists(clips_file):
+        raise HTTPException(status_code=404, detail="No clips database found")
+        
+    try:
+        # Read all existing clips
+        lines = []
+        with open(clips_file, "r") as f:
+            lines = f.readlines()
+            
+        # Filter out the matching clip
+        new_lines = []
+        found = False
+        for line in lines:
+            parts = line.strip().split("\t")
+            if len(parts) >= 3 and parts[2] == clip_id:
+                found = True
+                continue
+            elif len(parts) >= 1 and clip_id in parts[0]:
+                found = True
+                continue
+            new_lines.append(line)
+            
+        if not found:
+            raise HTTPException(status_code=404, detail="Clip not found in catalog")
+            
+        # Write back to file
+        with open(clips_file, "w") as f:
+            f.writelines(new_lines)
+            
+        # Sync with running bot memory
+        from app.twitch_bot import active_bot
+        if active_bot and hasattr(active_bot, 'clip_manager'):
+            active_bot.clip_manager.clip_urls = [
+                clip for clip in active_bot.clip_manager.clip_urls
+                if (isinstance(clip, dict) and clip.get('id') != clip_id) or
+                   (isinstance(clip, str) and clip_id not in clip)
+            ]
+            
+        return {"success": True, "message": f"Clip {clip_id} successfully deleted"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting clip {clip_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/settings")
+async def get_settings():
+    """Retrieve current system configuration settings"""
+    from app.twitch_bot import active_bot
+    
+    clip_threshold = 0.75
+    cooldown = 60
+    delay = 15.0
+    if active_bot:
+        clip_threshold = getattr(active_bot, "clip_threshold", 0.75)
+        cooldown = getattr(active_bot, "cooldown_period", 60)
+        delay = getattr(active_bot, "clip_delay", 15.0)
+    else:
+        clip_threshold = float(os.getenv("CLIP_THRESHOLD", "0.75"))
+        cooldown = int(os.getenv("CLIP_COOLDOWN", "60"))
+        delay = float(os.getenv("CLIP_DELAY", "15.0"))
+        
+    return {
+        "twitch_username": os.getenv("TWITCH_BOT_USERNAME", ""),
+        "twitch_client_id": os.getenv("TWITCH_CLIENT_ID", ""),
+        "twitch_client_secret": os.getenv("TWITCH_CLIENT_SECRET", ""),
+        "twitch_refresh_token": os.getenv("TWITCH_REFRESH_TOKEN", ""),
+        "twitch_access_token": os.getenv("TWITCH_ACCESS_TOKEN", ""),
+        "twitch_channels": os.getenv("TWITCH_CHANNELS", ""),
+        "clip_threshold": clip_threshold,
+        "clip_cooldown": cooldown,
+        "clip_delay": delay
+    }
+
+class SettingsUpdate(BaseModel):
+    twitch_username: str
+    twitch_client_id: str
+    twitch_client_secret: str
+    twitch_refresh_token: str
+    twitch_access_token: str
+    clip_threshold: float
+    clip_cooldown: int
+    clip_delay: float
+
+@app.post("/api/settings")
+async def update_settings(settings: SettingsUpdate):
+    """Update configuration settings in memory and write to the .env file"""
+    try:
+        dotenv_path = ".env"
+        lines = []
+        if os.path.exists(dotenv_path):
+            with open(dotenv_path, "r") as f:
+                lines = f.readlines()
+                
+        env_dict = {}
+        for line in lines:
+            if "=" in line and not line.strip().startswith("#"):
+                key, val = line.strip().split("=", 1)
+                env_dict[key.strip()] = val.strip()
+                
+        env_dict["TWITCH_BOT_USERNAME"] = settings.twitch_username
+        env_dict["TWITCH_CLIENT_ID"] = settings.twitch_client_id
+        env_dict["TWITCH_CLIENT_SECRET"] = settings.twitch_client_secret
+        env_dict["TWITCH_REFRESH_TOKEN"] = settings.twitch_refresh_token
+        env_dict["TWITCH_ACCESS_TOKEN"] = settings.twitch_access_token
+        env_dict["CLIP_THRESHOLD"] = str(settings.clip_threshold)
+        env_dict["CLIP_COOLDOWN"] = str(settings.clip_cooldown)
+        env_dict["CLIP_DELAY"] = str(settings.clip_delay)
+        
+        with open(dotenv_path, "w") as f:
+            f.write(f"TWITCH_CLIENT_ID={env_dict['TWITCH_CLIENT_ID']}\n")
+            f.write(f"TWITCH_CLIENT_SECRET={env_dict['TWITCH_CLIENT_SECRET']}\n")
+            f.write(f"TWITCH_ACCESS_TOKEN={env_dict['TWITCH_ACCESS_TOKEN']}\n")
+            f.write(f"TWITCH_REFRESH_TOKEN={env_dict['TWITCH_REFRESH_TOKEN']}\n")
+            f.write(f"TWITCH_CHANNELS={env_dict.get('TWITCH_CHANNELS', '')}\n")
+            f.write(f"TWITCH_BOT_USERNAME={env_dict['TWITCH_BOT_USERNAME']}\n\n")
+            f.write("# Clip Capture Settings\n")
+            f.write(f"CLIP_COOLDOWN={env_dict['CLIP_COOLDOWN']}\n")
+            f.write(f"CLIP_DELAY={env_dict['CLIP_DELAY']}\n")
+            f.write(f"CLIP_THRESHOLD={env_dict['CLIP_THRESHOLD']}\n")
+            
+        os.environ["TWITCH_BOT_USERNAME"] = settings.twitch_username
+        os.environ["TWITCH_CLIENT_ID"] = settings.twitch_client_id
+        os.environ["TWITCH_CLIENT_SECRET"] = settings.twitch_client_secret
+        os.environ["TWITCH_REFRESH_TOKEN"] = settings.twitch_refresh_token
+        os.environ["TWITCH_ACCESS_TOKEN"] = settings.twitch_access_token
+        os.environ["CLIP_THRESHOLD"] = str(settings.clip_threshold)
+        os.environ["CLIP_COOLDOWN"] = str(settings.clip_cooldown)
+        os.environ["CLIP_DELAY"] = str(settings.clip_delay)
+        
+        from app.twitch_bot import active_bot
+        if active_bot:
+            active_bot.cooldown_period = settings.clip_cooldown
+            active_bot.clip_delay = settings.clip_delay
+            active_bot.clip_threshold = settings.clip_threshold
+            active_bot.clip_manager.client_id = settings.twitch_client_id
+            active_bot.clip_manager.client_secret = settings.twitch_client_secret
+            active_bot.clip_manager.access_token = settings.twitch_access_token
+            active_bot.clip_manager.cooldown_period = settings.clip_cooldown
+            
+        return {"success": True, "message": "Settings updated successfully"}
+    except Exception as e:
+        logger.error(f"Error updating settings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

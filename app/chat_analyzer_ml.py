@@ -48,9 +48,9 @@ class Config:
     CHAT_BASELINE_UPDATE_INTERVAL: int = 2    # Changed from 1 to 2 seconds for message-based collection
     
     # ML model configuration
-    ML_CONTAMINATION_RATE: float = 0.01
+    ML_CONTAMINATION_RATE: float = 0.04
     ML_N_ESTIMATORS: int = 100
-    ML_MIN_TRAINING_SAMPLES: int = 100
+    ML_MIN_TRAINING_SAMPLES: int = 60
     ML_MIN_BASELINE_SAMPLES: int = 60
     ML_FEATURE_HISTORY_SIZE: int = 1000
     ML_MODEL_UPDATE_INTERVAL: int = 100  # Update every N samples
@@ -423,8 +423,15 @@ class ImprovedEmoteManager:
         client_id = os.getenv('TWITCH_CLIENT_ID')
         client_secret = os.getenv('TWITCH_CLIENT_SECRET')
         
-        if not client_id or not client_secret:
-            self.logger.error("Missing Twitch API credentials")
+        if not client_id:
+            self.logger.error("Missing TWITCH_CLIENT_ID credentials")
+            return None
+            
+        if not client_secret:
+            self.logger.warning("Missing TWITCH_CLIENT_SECRET. Falling back to TWITCH_ACCESS_TOKEN...")
+            user_token = os.getenv('TWITCH_ACCESS_TOKEN')
+            if user_token:
+                return user_token
             return None
         
         try:
@@ -451,7 +458,10 @@ class ImprovedEmoteManager:
                         self.logger.info("Successfully obtained and cached new Twitch API token")
                         return access_token
                     else:
-                        self.logger.error(f"Failed to get Twitch token: {resp.status}")
+                        self.logger.warning(f"Failed to get Twitch client credentials token (status {resp.status}). Falling back to TWITCH_ACCESS_TOKEN...")
+                        user_token = os.getenv('TWITCH_ACCESS_TOKEN')
+                        if user_token:
+                            return user_token
                         return None
                         
         except Exception as e:
@@ -610,6 +620,15 @@ class ImprovedEmoteManager:
         # Add channel 7TV emotes
         for cache in self.channel_7tv_caches.values():
             self.emote_dict.update(cache.emotes)
+            
+        # Add custom text slangs / vulgar reaction emotes for hype detection
+        custom_slang_emotes = {
+            "wtf", "lmao", "lmfao", "omg", "omfg", "holy", "shit", "fuck", 
+            "ns", "nt", "gg", "bruh", "crazy", "insane", "sick", "wdf", "bro", 
+            "no", "yes", "omgg", "tf", "f", "rip", "pog", "wow", "bs", "lmao"
+        }
+        for slang in custom_slang_emotes:
+            self.emote_dict[slang] = "default:slang"
         
         self.logger.info(f"Rebuilt emote dictionary with {len(self.emote_dict)} total emotes")
         
@@ -697,6 +716,14 @@ class ChatAnalyzerML:
         self.window_size = window_size or config.CHAT_WINDOW_SIZE
         self.channel = channel
         
+        # Thread lock for thread safety across multiple threads (TwitchIO, FastAPI, UI)
+        self.lock = threading.Lock()
+        
+        # Temporal collection state (every 10s)
+        self.last_baseline_collect = time.time()
+        self.last_training_collect = time.time()
+        self.new_samples_since_training = 0
+        
         # Core data structures (simplified)
         self.messages = deque(maxlen=config.CHAT_MESSAGE_HISTORY_SIZE)
         self.sentiment_analyzer = SentimentIntensityAnalyzer()
@@ -706,9 +733,15 @@ class ChatAnalyzerML:
         self.msg_count = 0
         self.last_reset = time.time()
         self.current_rate = 0
+        self.recent_msg_counts = deque(maxlen=5)
         
         # Total message counter (NEW - tracks actual total processed)
         self.total_messages_processed = 0
+        
+        # Logging state tracking to prevent spam
+        self._last_logged_score = None
+        self._last_logged_worthiness = None
+        self._last_logged_burst = {}
         
         # Start the reset timer in a separate thread
         self.running = True
@@ -760,19 +793,65 @@ class ChatAnalyzerML:
         self.channel_emotes = set()
         
     def _reset_counter(self):
-        """Reset message counter every second in a separate thread."""
+        """Reset message counter and collect baseline/training features periodically in a separate thread."""
         while self.running:
             time.sleep(config.CHAT_RESET_INTERVAL)
-            self.current_rate = self.msg_count
-            self.msg_count = 0
+            
+            # 1. Reset the message count velocity with a 5-second moving average
+            with self.lock:
+                self.recent_msg_counts.append(self.msg_count)
+                self.msg_count = 0
+                self.current_rate = self._get_chat_velocity_unlocked(datetime.now())
             self.last_reset = time.time()
+            
+            # 2. Check and perform temporal baseline collection (every 5 seconds)
+            now = time.time()
+            if now - self.last_baseline_collect >= 5.0:
+                with self.lock:
+                    # Minimum 0.1 to avoid zeros
+                    baseline_velocity = max(self.current_rate, 0.1)
+                    # Limit queue to size 60 representing exactly 5 minutes of baseline (60 * 5s)
+                    if self.baseline_velocities.maxlen != config.ML_MIN_BASELINE_SAMPLES:
+                        self.baseline_velocities = deque(self.baseline_velocities, maxlen=config.ML_MIN_BASELINE_SAMPLES)
+                    self.baseline_velocities.append(baseline_velocity)
+                    self.last_baseline_collect = now
+            
+            # 3. Check and perform temporal training feature collection (every 5 seconds)
+            if now - self.last_training_collect >= 5.0:
+                try:
+                    features = self.extract_features()
+                    
+                    with self.lock:
+                        if self.feature_history.maxlen != config.ML_FEATURE_HISTORY_SIZE:
+                            self.feature_history = deque(self.feature_history, maxlen=config.ML_FEATURE_HISTORY_SIZE)
+                        self.feature_history.append(features)
+                        self.last_training_collect = now
+                        self.new_samples_since_training += 1
+                        
+                        baseline_count = len(self.baseline_velocities)
+                        training_count = len(self.feature_history)
+                        
+                        # Show progress periodically
+                        if training_count % 10 == 0:
+                            self.logger.info(f"Progress - Baseline: {baseline_count}/{config.ML_MIN_BASELINE_SAMPLES}, Training: {training_count}/{config.ML_MIN_TRAINING_SAMPLES}")
+                        
+                        # Train if we have enough samples and we have collected enough new samples
+                        if (training_count >= config.ML_MIN_TRAINING_SAMPLES and
+                            baseline_count >= config.ML_MIN_BASELINE_SAMPLES and
+                            self.new_samples_since_training >= 30):
+                            
+                            self.logger.info("🎯 ML model training conditions met! Updating model...")
+                            self._update_model_internal()
+                            self.new_samples_since_training = 0
+                except Exception as e:
+                    self.logger.debug(f"Error in background feature collection: {e}")
 
     def update_viewer_count(self, count: int) -> None:
         """Update the current viewer count."""
         self.viewer_count = max(1, count)
 
     def add_message(self, message: str, user_id: str, timestamp: datetime) -> None:
-        """Process a chat message and update analysis."""
+        """Process a chat message and update analysis (thread-safe)."""
         try:
             # Pre-calculate sentiment to avoid repeated computation
             sentiment_data = self.sentiment_analyzer.polarity_scores(message.lower())
@@ -789,11 +868,12 @@ class ChatAnalyzerML:
             
             # Add to emote window for burst detection
             if emotes:
-                self.emote_window.append({
-                    'user_id': user_id,
-                    'emotes': emotes,
-                    'timestamp': timestamp
-                })
+                with self.lock:
+                    self.emote_window.append({
+                        'user_id': user_id,
+                        'emotes': emotes,
+                        'timestamp': timestamp
+                    })
             
             # Increment message counter for velocity tracking
             self.msg_count += 1
@@ -810,76 +890,36 @@ class ChatAnalyzerML:
                 'sentiment': sentiment_data
             }
             
-            self.messages.append(msg_data)
-            
-            # FIXED: Synchronized baseline and training collection
-            # Both are now message-based with proper rate limiting
-            now = time.time()
-            message_count = len(self.messages)
-            
-            # Collect baseline every 3 messages OR every 2 seconds (whichever comes first)
-            should_collect_baseline = (
-                message_count % 3 == 0 or  # Every 3 messages
-                now - self.last_baseline_update.timestamp() >= 2.0  # Or every 2 seconds minimum
-            )
-            
-            if should_collect_baseline:
-                # Always collect baseline, even if current_rate is 0
-                baseline_velocity = max(self.current_rate, 0.1)  # Minimum 0.1 to avoid zeros
-                self.baseline_velocities.append(baseline_velocity)
-                self.last_baseline_update = datetime.fromtimestamp(now)
-                
-                # Debug logging with synchronized progress
-                baseline_count = len(self.baseline_velocities)
-                training_count = len(self.feature_history)
-                if baseline_count % 10 == 0:  # Log every 10th sample
-                    self.logger.info(f"Progress - Baseline: {baseline_count}/60, Training: {training_count}/100")
-            
-            # Collect training features every 2 messages (after we have at least 10 messages)
-            # This ensures training samples collect at a reasonable rate
-            should_collect_training = (
-                message_count >= 10 and 
-                message_count % 2 == 0 and  # Every 2 messages
-                len(self.feature_history) < config.ML_MIN_TRAINING_SAMPLES  # STOP at target
-            )
-            
-            if should_collect_training:
-                try:
-                    features = self.extract_features()
-                    self.feature_history.append(features)
-                    
-                    # Debug logging with synchronized progress
-                    baseline_count = len(self.baseline_velocities)
-                    training_count = len(self.feature_history)
-                    if training_count % 25 == 0:  # Log every 25th sample
-                        self.logger.info(f"Progress - Baseline: {baseline_count}/60, Training: {training_count}/100")
-                        
-                    # Trigger model update if we have enough data
-                    if (training_count >= 100 and 
-                        baseline_count >= 60 and 
-                        training_count % 50 == 0):  # Update every 50 samples
-                        self.logger.info("🎯 ML model training conditions met! Updating model...")
-                        self.update_model()
-                        
-                except Exception as e:
-                    self.logger.debug(f"Error extracting features: {e}")
+            with self.lock:
+                self.messages.append(msg_data)
                     
         except Exception as e:
             self.logger.error(f"Error processing message: {e}", exc_info=True)
 
+    def _get_chat_velocity_unlocked(self, now: datetime) -> float:
+        """Calculate chat velocity over the last 5 seconds (unlocked helper)."""
+        cutoff = now - timedelta(seconds=5)
+        count = sum(1 for m in self.messages if m['timestamp'] > cutoff)
+        return count / 5.0
+
     def get_chat_velocity(self) -> float:
-        """Get the current messages per second."""
-        return self.current_rate
+        """Get the current messages per second dynamically with zero latency."""
+        now = datetime.now()
+        with self.lock:
+            return self._get_chat_velocity_unlocked(now)
         
     def get_velocity_zscore(self) -> float:
-        """Calculate Z-score of current velocity compared to historical baseline."""
-        if len(self.baseline_velocities) < 60:  # Need 1 minute of baseline data
+        """Calculate Z-score of current velocity compared to historical baseline (thread-safe)."""
+        with self.lock:
+            baseline_velocities_copy = list(self.baseline_velocities)
+            
+        if len(baseline_velocities_copy) < 60:  # Need 1 minute of baseline data
             return 0.0
             
         current_velocity = self.get_chat_velocity()
         
         # Calculate using baseline stats
-        velocities = np.array(list(self.baseline_velocities))
+        velocities = np.array(baseline_velocities_copy)
         mean_velocity = np.mean(velocities)
         std_velocity = np.std(velocities)
         
@@ -918,8 +958,11 @@ class ChatAnalyzerML:
         return normalized_score
         
     def get_average_sentiment(self) -> float:
-        """Calculate average sentiment in current window (using pre-calculated values)."""
-        if not self.messages:
+        """Calculate average sentiment in current window (using pre-calculated values, thread-safe)."""
+        with self.lock:
+            messages_copy = list(self.messages)
+            
+        if not messages_copy:
             return 0.0
             
         now = datetime.now()
@@ -928,7 +971,7 @@ class ChatAnalyzerML:
         try:
             # Get messages in window (sentiment already calculated)
             window_messages = [
-                msg for msg in self.messages
+                msg for msg in messages_copy
                 if msg['timestamp'] > window_start and 'sentiment' in msg
             ]
             
@@ -972,7 +1015,12 @@ class ChatAnalyzerML:
             # Popular Third-Party Emotes
             "KEKW", "OMEGALUL", "PogU", "PepeLaugh", "WeirdChamp", "Pog", "monkaS", "pepeD",
             "widepeepoHappy", "LULW", "Sadge", "PepeHands", "HYPERS", "monkaW", "5Head",
-            "Pepega", "catJAM", "AYAYA", "PepoG", "PauseChamp", "Copium", "peepoGlad"
+            "Pepega", "catJAM", "AYAYA", "PepoG", "PauseChamp", "Copium", "peepoGlad",
+            
+            # Custom Reaction/Slang/Mildly Vulgar Emotes
+            "wtf", "lmao", "lmfao", "omg", "omfg", "holy", "shit", "fuck", 
+            "ns", "nt", "gg", "bruh", "crazy", "insane", "sick", "wdf", "bro", 
+            "no", "yes", "omgg", "tf", "f", "rip", "pog", "wow", "bs"
         }
         
         # Add emotes to our dictionaries with sources for debugging
@@ -1003,8 +1051,13 @@ class ChatAnalyzerML:
         except Exception as e:
             self.logger.error(f"Error updating emotes: {e}", exc_info=True)
 
-    def load_ml_model(self):
-        """Load the ML model, scaler, and feature history from disk if available."""
+    def load_ml_model(self) -> bool:
+        """Load the ML model, scaler, and feature history from disk if available (thread-safe)."""
+        with self.lock:
+            return self._load_ml_model_internal()
+            
+    def _load_ml_model_internal(self) -> bool:
+        """Internal helper to load the ML model (should be called with lock held)."""
         if not self.channel:
             self.logger.warning("Cannot load ML model: No channel name provided")
             return False
@@ -1024,58 +1077,70 @@ class ChatAnalyzerML:
                 self.logger.info(f"No saved ML model found for channel {self.channel}")
                 return False
                 
-            # Load isolation forest model
-            self.isolation_forest = joblib.load(model_path)
-            
-            # Load scaler
-            self.scaler = joblib.load(scaler_path)
-            
-            # Load feature history if available - but limit to minimum required for operation
-            if features_path.exists():
-                with open(features_path, 'rb') as f:
-                    loaded_features = pickle.load(f)
-                    # Only load the minimum required for training (100 samples max)
-                    # This prevents starting with too many samples and causing immediate 100% scores
-                    max_features_to_load = config.ML_MIN_TRAINING_SAMPLES
-                    if len(loaded_features) > max_features_to_load:
-                        # Take the most recent samples only
-                        loaded_features = loaded_features[-max_features_to_load:]
-                        self.logger.info(f"Loaded {len(loaded_features)} recent features (trimmed from {len(pickle.load(open(features_path, 'rb')))})")
-                    
-                    # Convert list back to deque with training limit as maxlen
-                    self.feature_history = deque(loaded_features, maxlen=config.ML_MIN_TRAINING_SAMPLES)
-                    
-            # Load baseline velocities if available - limit to minimum required  
-            if baseline_path.exists():
-                with open(baseline_path, 'rb') as f:
-                    loaded_baseline = pickle.load(f)
-                    # Only load the minimum required for baseline (60 samples max)
-                    max_baseline_to_load = config.ML_MIN_BASELINE_SAMPLES
-                    if len(loaded_baseline) > max_baseline_to_load:
-                        # Take the most recent samples only
-                        loaded_baseline = loaded_baseline[-max_baseline_to_load:]
+            # Load the files inside a sub-try block to catch corruption exceptions
+            try:
+                # Load isolation forest model
+                self.isolation_forest = joblib.load(model_path)
+                
+                # Load scaler
+                self.scaler = joblib.load(scaler_path)
+                
+                # Load feature history if available - limit to maximum history size
+                if features_path.exists():
+                    with open(features_path, 'rb') as f:
+                        loaded_features = pickle.load(f)
+                        max_features_to_load = config.ML_FEATURE_HISTORY_SIZE
+                        if len(loaded_features) > max_features_to_load:
+                            loaded_features = loaded_features[-max_features_to_load:]
+                            self.logger.info(f"Loaded {len(loaded_features)} recent features (trimmed from {len(pickle.load(open(features_path, 'rb')))})")
                         
-                    # Convert list back to deque with baseline limit as maxlen
-                    self.baseline_velocities = deque(loaded_baseline, maxlen=config.ML_MIN_BASELINE_SAMPLES)
-                    
-            self.logger.info(
-                f"ML model loaded for channel {self.channel}: "
-                f"{len(self.feature_history)} features, "
-                f"{len(self.baseline_velocities)} baseline samples"
-            )
-            return True
+                        # Convert list back to deque with proper maximum history size
+                        self.feature_history = deque(loaded_features, maxlen=config.ML_FEATURE_HISTORY_SIZE)
+                        
+                # Load baseline velocities if available - limit to minimum required  
+                if baseline_path.exists():
+                    with open(baseline_path, 'rb') as f:
+                        loaded_baseline = pickle.load(f)
+                        max_baseline_to_load = config.ML_MIN_BASELINE_SAMPLES
+                        if len(loaded_baseline) > max_baseline_to_load:
+                            loaded_baseline = loaded_baseline[-max_baseline_to_load:]
+                            
+                        # Convert list back to deque with baseline limit as maxlen
+                        self.baseline_velocities = deque(loaded_baseline, maxlen=config.ML_MIN_BASELINE_SAMPLES)
+                        
+                self.logger.info(
+                    f"ML model loaded for channel {self.channel}: "
+                    f"{len(self.feature_history)} features, "
+                    f"{len(self.baseline_velocities)} baseline samples"
+                )
+                return True
+                
+            except Exception as load_err:
+                self.logger.warning(
+                    f"Saved ML model files for channel {self.channel} were corrupted or invalid: {load_err}. "
+                    "Deleting corrupted files and starting fresh training..."
+                )
+                # Delete corrupted files to prevent future crash loops
+                for path in [model_path, scaler_path, features_path, baseline_path]:
+                    try:
+                        if path.exists():
+                            path.unlink()
+                    except Exception:
+                        pass
+                
+                # Reset to new models
+                self.scaler = StandardScaler()
+                self.isolation_forest = IsolationForest(
+                    contamination=config.ML_CONTAMINATION_RATE,
+                    random_state=42,
+                    n_estimators=config.ML_N_ESTIMATORS,
+                    max_samples='auto',
+                    bootstrap=True
+                )
+                return False
             
         except Exception as e:
             self.logger.error(f"Error loading ML model: {e}", exc_info=True)
-            # Reset to new models if loading failed
-            self.scaler = StandardScaler()
-            self.isolation_forest = IsolationForest(
-                contamination=config.ML_CONTAMINATION_RATE,
-                random_state=42,
-                n_estimators=config.ML_N_ESTIMATORS,
-                max_samples='auto',
-                bootstrap=True
-            )
             return False
 
     def __del__(self):
@@ -1085,22 +1150,27 @@ class ChatAnalyzerML:
             self.reset_thread.join(timeout=1.0)
             
         # Save ML model on exit if we have enough data
-        if hasattr(self, 'feature_history') and len(self.feature_history) >= config.ML_MIN_TRAINING_SAMPLES:
-            self.save_ml_model()
+        if hasattr(self, 'feature_history'):
+            with self.lock:
+                if len(self.feature_history) >= config.ML_MIN_TRAINING_SAMPLES:
+                    self._save_ml_model_internal()
         
     def get_emote_burst_score(self) -> float:
         """
-        Simplified emote burst score focusing on core signals.
+        Simplified emote burst score focusing on core signals (thread-safe).
         Reduced complexity for better performance and future extensibility.
         """
-        if not self.emote_window:
+        with self.lock:
+            emote_window_copy = list(self.emote_window)
+            
+        if not emote_window_copy:
             return 0.0
         
         now = datetime.now()
         window_start = now - timedelta(seconds=self.emote_window_size)
         
         # Get recent emote usage
-        recent_entries = [e for e in self.emote_window if e['timestamp'] > window_start]
+        recent_entries = [e for e in emote_window_copy if e['timestamp'] > window_start]
         
         if not recent_entries:
             return 0.0
@@ -1139,9 +1209,11 @@ class ChatAnalyzerML:
         else:
             density_score = 0.0
         
-        # 3. Viewer participation bonus (20 points max)
+        # 3. Viewer participation bonus (20 points max) using sub-linear square root scaling
+        import math
         viewer_count = max(self.viewer_count, 1)
-        viewer_participation = min(unique_users_count / (viewer_count * 0.01), 1.0)
+        required_users = max(math.sqrt(viewer_count) * 0.3, 2.0)
+        viewer_participation = min(unique_users_count / required_users, 1.0)
         viewer_bonus = viewer_participation * 20.0
         
         # Combine scores
@@ -1149,11 +1221,14 @@ class ChatAnalyzerML:
         
         # Log for debugging if significant
         if final_score > 15:
-            self.logger.debug(
-                f"Emote burst: {emote_name} | "
-                f"Users: {unique_users_count}/{total_users_in_window} | "
-                f"Score: {final_score:.1f} (user:{user_score:.1f}, density:{density_score:.1f}, viewer:{viewer_bonus:.1f})"
-            )
+            log_sig = f"{unique_users_count}/{total_users_in_window}|{final_score:.3f}"
+            if self._last_logged_burst.get(emote_name) != log_sig:
+                self.logger.debug(
+                    f"Emote burst: {emote_name} | "
+                    f"Users: {unique_users_count}/{total_users_in_window} | "
+                    f"Score: {final_score:.3f} (user:{user_score:.3f}, density:{density_score:.3f}, viewer:{viewer_bonus:.3f})"
+                )
+                self._last_logged_burst[emote_name] = log_sig
         
         return min(final_score, config.FEATURE_MAX_BURST_SCORE)
         
@@ -1183,11 +1258,11 @@ class ChatAnalyzerML:
             
             # Simplified rule-based score
             rule_score = 0.0
-            # ONLY trigger on POSITIVE velocity spikes (ignore negative Z-scores)
-            if velocity_zscore > 2.0:  # Strong velocity spike ABOVE baseline
-                rule_score += min(velocity_zscore / 8.0, 0.6)
-            if burst_score > 20.0:  # Strong burst activity
-                rule_score += min(burst_score / 80.0, 0.6)
+            # ONLY trigger on POSITIVE velocity and burst spikes relative to channel size
+            if velocity_relative > 2.0:  # Strong velocity spike relative to channel
+                rule_score += min(velocity_relative / 6.0, 0.6)
+            if burst_relative > 1.2:  # Strong burst activity relative to channel
+                rule_score += min(burst_relative / 3.0, 0.6)
                 
             # Get ML prediction if we have enough data
             if len(self.feature_history) >= config.ML_MIN_TRAINING_SAMPLES and len(self.baseline_velocities) >= config.ML_MIN_BASELINE_SAMPLES:
@@ -1231,9 +1306,12 @@ class ChatAnalyzerML:
                 'sentiment': sentiment
             }
             
-            # Debug logging for high scores
-            if clip_worthy_score > 0.5:
-                logger.info(f"High clip worthiness: {clip_worthy_score:.3f} (rule: {rule_score:.2f}, ML: {ml_score:.2f}) for {viewer_count} viewers")
+            # Enhanced threshold logic and detailed logging
+            if clip_worthy_score > 0.80:  # Base awareness threshold
+                log_sig = f"{clip_worthy_score:.3f}|{rule_score:.3f}|{ml_score:.3f}|{viewer_count}"
+                if self._last_logged_worthiness != log_sig:
+                    logger.info(f"High clip worthiness: {clip_worthy_score:.3f} (rule: {rule_score:.3f}, ML: {ml_score:.3f}) for {viewer_count} viewers")
+                    self._last_logged_worthiness = log_sig
                 
             return stats
             
@@ -1248,8 +1326,13 @@ class ChatAnalyzerML:
                 'sentiment': 0.0
             }
 
-    def save_ml_model(self):
-        """Save the ML model, scaler, and sample feature history to disk."""
+    def save_ml_model(self) -> bool:
+        """Save the ML model, scaler, and sample feature history to disk (thread-safe)."""
+        with self.lock:
+            return self._save_ml_model_internal()
+            
+    def _save_ml_model_internal(self) -> bool:
+        """Internal helper to save the ML model (should be called with lock held)."""
         if not self.channel:
             self.logger.warning("Cannot save ML model: No channel name provided")
             return False
@@ -1292,51 +1375,59 @@ class ChatAnalyzerML:
         """
         Determine if moment is clip-worthy using unsupervised learning.
         Returns (is_worthy, anomaly_score)
+        
+        This method is read-only and thread-safe.
         """
         try:
             # Extract current features
             features = self.extract_features()
             
-            # Add to history
-            self.feature_history.append(features)
-            
-            # Need enough data for meaningful detection using config values
-            if len(self.feature_history) < config.ML_MIN_TRAINING_SAMPLES or len(self.baseline_velocities) < config.ML_MIN_BASELINE_SAMPLES:
-                # Fall back to rule-based approach if not enough data
-                velocity_relative = features[1] if len(features) > 1 else 0.0  # Velocity relative to channel size
-                burst_relative = features[3] if len(features) > 3 else 0.0     # Burst score relative to channel size
+            with self.lock:
+                history_len = len(self.feature_history)
+                baseline_len = len(self.baseline_velocities)
                 
-                # Simple rule-based approach until we have enough data
-                # ONLY consider POSITIVE spikes, ignore negative anomalies
-                rule_score = 0.0
-                if velocity_relative > 3.0:
-                    rule_score += min(velocity_relative / 5.0, 0.7)
-                if burst_relative > 1.5:
-                    rule_score += min(burst_relative / 3.0, 0.6)
+                # Need enough data for meaningful detection using config values
+                if history_len < config.ML_MIN_TRAINING_SAMPLES or baseline_len < config.ML_MIN_BASELINE_SAMPLES:
+                    # Fall back to rule-based approach if not enough data
+                    velocity_relative = features[1] if len(features) > 1 else 0.0  # Velocity relative to channel size
+                    burst_relative = features[3] if len(features) > 3 else 0.0     # Burst score relative to channel size
                     
-                return rule_score > 0.5, rule_score
+                    # Simple rule-based approach until we have enough data
+                    # ONLY consider POSITIVE spikes, ignore negative anomalies
+                    rule_score = 0.0
+                    if velocity_relative > 3.0:
+                        rule_score += min(velocity_relative / 5.0, 0.7)
+                    if burst_relative > 1.5:
+                        rule_score += min(burst_relative / 3.0, 0.6)
+                        
+                    return rule_score > 0.5, rule_score
+                    
+                # Scale features under lock
+                try:
+                    features_scaled = self.scaler.transform(features.reshape(1, -1))
+                except Exception:
+                    self.logger.error("Error scaling features, trying to rebuild scaler")
+                    # Try rebuilding scaler
+                    X = np.array(list(self.feature_history))
+                    self.scaler.fit(X)
+                    # Try again
+                    features_scaled = self.scaler.transform(features.reshape(1, -1))
                 
-            # Update model periodically using config interval
-            if len(self.feature_history) % config.ML_MODEL_UPDATE_INTERVAL == 0:
-                self.update_model()
+                # Get anomaly score (-1 for anomalies, 1 for normal)
+                try:
+                    score = self.isolation_forest.score_samples(features_scaled)[0]
+                except Exception as e:
+                    self.logger.error(f"Error getting anomaly score: {e}, falling back to rule score")
+                    velocity_relative = features[1] if len(features) > 1 else 0.0
+                    burst_relative = features[3] if len(features) > 3 else 0.0
+                    rule_score = 0.0
+                    if velocity_relative > 3.0:
+                        rule_score += min(velocity_relative / 5.0, 0.7)
+                    if burst_relative > 1.5:
+                        rule_score += min(burst_relative / 3.0, 0.6)
+                    return rule_score > 0.5, rule_score
                 
-            # Scale features with error handling
-            try:
-                features_scaled = self.scaler.transform(features.reshape(1, -1))
-            except Exception:
-                self.logger.error("Error scaling features, trying to rebuild scaler")
-                # Try rebuilding scaler
-                X = np.array(list(self.feature_history))
-                self.scaler.fit(X)
-                # Try again
-                features_scaled = self.scaler.transform(features.reshape(1, -1))
-            
-            # Get anomaly score (-1 for anomalies, 1 for normal)
-            try:
-                score = self.isolation_forest.score_samples(features_scaled)[0]
-            except Exception as e:
-                self.logger.error(f"Error getting anomaly score: {e}")
-                return False, 0.0
+                baseline_mean = np.mean(list(self.baseline_velocities)) if len(self.baseline_velocities) > 0 else 0.0
             
             # Convert to probability-like score (0 to 1, higher means more anomalous)
             prob_score = 1 - (score + 1) / 2
@@ -1344,39 +1435,37 @@ class ChatAnalyzerML:
             # CRITICAL FIX: Only consider anomalies if they represent POSITIVE spikes
             # Check if current activity is actually above baseline
             current_velocity = self.get_chat_velocity()
-            baseline_mean = np.mean(list(self.baseline_velocities)) if len(self.baseline_velocities) > 0 else 0.0
             
             # If current activity is BELOW baseline, don't consider it clip-worthy
             if current_velocity <= baseline_mean:
                 prob_score = 0.0  # Reset to 0 for below-baseline activity
             
-            # Apply a more conservative scaling to prevent constant high scores
-            # Reduce the baseline anomaly score to make it more selective
-            prob_score = prob_score * 0.7  # Scale down base score
-            
+            # Apply scaling to prevent constant high scores but allow strong spikes to trigger
+            # REMOVED: prob_score = prob_score * 0.8  (Hardcoded dampening removed per user request to not suppress pure ML anomalies)
             # Boost score based on velocity and burst features
             velocity_relative = features[1] if len(features) > 1 else 0.0
             burst_relative = features[3] if len(features) > 3 else 0.0
             
-            # Boost based on strong relative signals (already accounting for channel size)
             # ONLY boost for POSITIVE spikes above baseline
             if velocity_relative > 2.0:  # Strong velocity relative to channel size
-                vel_boost = min(velocity_relative / 15.0, 0.2)  # Reduced from /10.0 to /15.0 and max from 0.25 to 0.2
+                vel_boost = min(velocity_relative / 12.0, 0.25)
                 prob_score = min(prob_score + vel_boost, 1.0)
                 
             if burst_relative > 1.5:  # Strong burst relative to channel size
-                burst_boost = min(burst_relative / 12.0, 0.2)  # Reduced from /8.0 to /12.0 and max from 0.25 to 0.2
+                burst_boost = min(burst_relative / 10.0, 0.25)
                 prob_score = min(prob_score + burst_boost, 1.0)
                 
             # Log high-scoring moments for debugging
             if prob_score > 0.8:
-                self.logger.info(
-                    f"High clip score: {prob_score:.3f} | "
-                    f"Velocity: {velocity_relative:.2f} | "
-                    f"Burst: {burst_relative:.2f} | "
-                    f"Viewers: {self.viewer_count:,}"
-                )
-                
+                log_sig = f"{prob_score:.3f}|{velocity_relative:.3f}|{burst_relative:.3f}"
+                if self._last_logged_score != log_sig:
+                    self.logger.info(
+                        f"High clip score: {prob_score:.3f} | "
+                        f"Velocity: {velocity_relative:.3f} | "
+                        f"Burst: {burst_relative:.3f} | "
+                        f"Viewers: {self.viewer_count}"
+                    )
+                    self._last_logged_score = log_sig
             # Use config threshold
             return prob_score > config.ML_CLIP_THRESHOLD, prob_score
             
@@ -1385,7 +1474,12 @@ class ChatAnalyzerML:
             return False, 0.0
 
     def update_model(self):
-        """Update the isolation forest model with new data."""
+        """Update the isolation forest model with new data (thread-safe)."""
+        with self.lock:
+            self._update_model_internal()
+            
+    def _update_model_internal(self):
+        """Internal helper to update the isolation forest model (should be called with lock held)."""
         if len(self.feature_history) < config.ML_MIN_TRAINING_SAMPLES:
             return
             
@@ -1403,7 +1497,7 @@ class ChatAnalyzerML:
             X_scaled = self.scaler.fit_transform(X)
             
             # Configure isolation forest with config parameters
-            self.isolation_forest = IsolationForest(
+            new_forest = IsolationForest(
                 contamination=config.ML_CONTAMINATION_RATE,
                 random_state=42,
                 n_estimators=config.ML_N_ESTIMATORS,
@@ -1412,10 +1506,11 @@ class ChatAnalyzerML:
             )
             
             # Fit isolation forest
-            self.isolation_forest.fit(X_scaled)
+            new_forest.fit(X_scaled)
+            self.isolation_forest = new_forest
             
-            # Save model to disk
-            self.save_ml_model()
+            # Save model to disk (internal helper, lock already held)
+            self._save_ml_model_internal()
             
             # Log success
             self.logger.info(f"ML model updated with {len(X)} training samples")

@@ -37,7 +37,7 @@ class ClipManager:
         self.output_dir = output_dir
         self.clips_file = os.path.join(output_dir, "clip_urls.txt")
         self.cooldown_period = int(
-            os.getenv('CLIP_COOLDOWN', '10'))  # Seconds between clips
+            os.getenv('CLIP_COOLDOWN', '60'))  # Seconds between clips
 
         # Get credentials from environment
         self.client_id = os.getenv('TWITCH_CLIENT_ID', '')

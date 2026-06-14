@@ -79,11 +79,20 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Enable CORS for frontend development
+# Enable CORS dynamically for development and production
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS")
+if allowed_origins_env:
+    allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()]
+    allow_credentials = True
+else:
+    allowed_origins = ["http://localhost:3000", "http://localhost:3001", "*"]
+    # If using wildcard "*", allow_credentials must be False
+    allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],  # React dev servers
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )

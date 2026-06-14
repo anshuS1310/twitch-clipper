@@ -1,5 +1,7 @@
 # Twitch Clipper
 
+**Live Demo** : https://twitch-clipper-frontend.onrender.com/
+
 Automatically creates clips from Twitch streams during exciting moments by analyzing chat activity. It uses machine learning to detect clip-worthy moments based on chat velocity spikes, emote bursts and anomaly detection models that learn each channel’s unique patterns. 
 Its core features include an adaptive ML model that continuously improves and persists between sessions, dynamic sensitivity thresholds that adjust to channel size, separate models for each channel and a hybrid rule-and-ML approach for reliable triggering. 
 In operation, it monitors real-time chat metrics, applies ML to identify unusual activity, waits seven seconds to ensure the full context is captured, then generates the clip—while continuously refining its understanding from new data. 
